@@ -1,0 +1,69 @@
+stages:
+  - build
+  - scan
+  - push
+  - deploy
+
+variables:
+  REGISTRY: 192.168.237.135:5001
+  API_IMAGE: $REGISTRY/hello-api:$CI_COMMIT_SHORT_SHA
+  FRONTEND_IMAGE: $REGISTRY/hello-frontend:$CI_COMMIT_SHORT_SHA
+
+.docker-job:
+  image: docker:27
+  before_script:
+    - docker info
+
+build-api:
+  stage: build
+  extends: .docker-job
+  script:
+    - docker build -t $API_IMAGE ./api
+
+build-frontend:
+  stage: build
+  extends: .docker-job
+  script:
+    - docker build -t $FRONTEND_IMAGE ./frontend
+
+scan:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy fs --quiet .
+    - trivy config --quiet .
+
+push:
+  stage: push
+  extends: .docker-job
+  script:
+    - docker build -t $API_IMAGE ./api
+    - docker build -t $FRONTEND_IMAGE ./frontend
+    - docker push $API_IMAGE
+    - docker push $FRONTEND_IMAGE
+
+deploy:
+  stage: deploy
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+    - CLUSTER_NAME=$(kubectl config view --raw -o jsonpath='{.clusters[0].name}')
+    - SERVER=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.server}')
+    - FIXED_SERVER=$(echo "$SERVER" | sed 's#https://[^:]*:#https://192.168.237.135:#')
+    - kubectl config set-cluster "$CLUSTER_NAME" --server="$FIXED_SERVER" --insecure-skip-tls-verify=true
+    - kubectl get nodes
+    - kubectl create namespace devops-lab --dry-run=client -o yaml | kubectl apply -f -
+    - sed "s|__API_IMAGE__|$API_IMAGE|g" k8s/api.yaml > /tmp/api.yaml
+    - sed "s|__FRONTEND_IMAGE__|$FRONTEND_IMAGE|g" k8s/frontend.yaml > /tmp/frontend.yaml
+    - kubectl apply -n devops-lab -f /tmp/api.yaml
+    - kubectl apply -n devops-lab -f /tmp/frontend.yaml
+    - kubectl apply -f k8s/ingress.yaml
+    - kubectl rollout status deployment/api -n devops-lab --timeout=180s
+    - kubectl rollout status deployment/frontend -n devops-lab --timeout=180s
+  only:
+    - main
